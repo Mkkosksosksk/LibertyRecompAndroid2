@@ -1,0 +1,125 @@
+name: Android APK
+
+# RASCUNHO NAO TESTADO. Segue os passos do docs/android/BUILDING.md em um
+# runner Windows, porque os scripts usam Git Bash, cygpath e dxc.exe.
+# Dispara so manualmente: aba Actions > "Android APK" > Run workflow.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Build debug APK
+    runs-on: windows-2022
+    timeout-minutes: 355   # limite do GitHub e 360 min por job
+    defaults:
+      run:
+        shell: bash        # Git Bash do runner Windows
+
+    env:
+      NDK_VER: 29.0.14206865   # NDK r29, exigido pelo BUILDING.md
+      STRIP: "1"               # APK de ~50 MB em vez de ~170 MB
+      # O runner ja define ANDROID_NDK apontando para o NDK 27.3, e o env.sh
+      # respeita o valor existente. Forcamos o r29 (barras normais, estilo Git Bash).
+      ANDROID_HOME: C:/Android/android-sdk
+      ANDROID_SDK_ROOT: C:/Android/android-sdk
+      ANDROID_NDK: C:/Android/android-sdk/ndk/29.0.14206865
+      ANDROID_NDK_HOME: C:/Android/android-sdk/ndk/29.0.14206865
+      ANDROID_NDK_ROOT: C:/Android/android-sdk/ndk/29.0.14206865
+
+    steps:
+      - name: Permitir caminhos longos no Git
+        run: git config --system core.longpaths true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: CMake e Ninja
+        run: python -m pip install 'cmake>=3.29,<5' ninja
+
+      - name: Android SDK 35 e NDK r29
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:-<vazio>}"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager.bat"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-35" "platform-tools" "ndk;${NDK_VER}"
+          ls "$ANDROID_HOME/ndk"
+          # O env.sh chama "adb devices". O PATH que ele monta usa o estilo C:\ e
+          # quebra no Git Bash, entao o adb precisa ja estar no PATH do runner.
+          echo 'C:\Android\android-sdk\platform-tools' >> "$GITHUB_PATH"
+
+      - name: Dependencias pinadas e patches
+        run: python tools/setup_repo.py
+
+      # O Git do Windows converte o fim de linha para CRLF no checkout, o que
+      # quebra scripts .sh no bash (erro 127). Convertemos so os scripts, DEPOIS
+      # do setup_repo.py, para nao mexer nos patches das dependencias.
+      - name: Converter scripts .sh para LF
+        run: |
+          find os tools -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
+          head -n 3 os/android/scripts/build_driver_proxy.sh | cat -A
+
+      - name: Diagnostico dos scripts (so para achar o erro 127)
+        run: |
+          pwd
+          ls -la os/android/scripts || echo "PASTA os/android/scripts NAO EXISTE NO FORK"
+          head -n 3 os/android/scripts/build_driver_proxy.sh | cat -A || true
+          for t in python python3 cygpath cmake ninja git; do printf '%s -> ' "$t"; command -v "$t" || echo "NAO ACHADO"; done
+
+      - name: Proxy do driver Vulkan e hooks do libadrenotools
+        run: |
+          echo "ANDROID_HOME=${ANDROID_HOME:-<vazio>} NDK_VER=${NDK_VER:-<vazio>} JAVA_HOME=${JAVA_HOME:-<vazio>}"
+          ls "$ANDROID_HOME/ndk" || true
+          # -x mostra cada comando do script; o ultimo antes do erro e o culpado
+          bash -x os/android/scripts/build_driver_proxy.sh 2>&1
+
+      - name: Build nativo (jogo, runtime e renderer)
+        run: bash os/android/scripts/build_native.sh
+
+      - name: Empacotar o APK
+        run: |
+          rm -f os/android/app/build/outputs/apk/debug/app-debug.apk
+          bash os/android/scripts/build_apk.sh
+
+      - name: Enviar o APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LibertyRecompAndroid-debug-apk
+          path: os/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Enviar logs do CMake se falhar
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-logs
+          path: |
+            out/**/CMakeFiles/CMakeOutput.log
+            out/**/CMakeFiles/CMakeError.log
+            out/**/CMakeCache.txt
+          if-no-files-found: ignore
+          retention-days: 7
